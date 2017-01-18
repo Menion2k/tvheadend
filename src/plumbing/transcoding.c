@@ -27,6 +27,7 @@
 #include <libavutil/opt.h>
 #include <libavutil/audio_fifo.h>
 #include <libavutil/dict.h>
+#include <libavutil/pixdesc.h>
 
 #if LIBAVUTIL_VERSION_MICRO >= 100 /* FFMPEG */
 #define USING_FFMPEG 1
@@ -42,9 +43,18 @@
 #include "parsers/bitstream.h"
 #include "parsers/parser_avc.h"
 
+#define NUMBER_OF_VIDEO_STAGES		3
+#define NUMBER_OF_FILTER_STAGES		1
+
 LIST_HEAD(transcoder_stream_list, transcoder_stream);
 
 struct transcoder;
+
+typedef enum {
+	TS_ENCODER_STAGE = 0,
+	TS_DECODER_STAGE,
+	TS_FILTER_STAGE
+} stage_type_t;
 
 typedef struct transcoder_stream {
   int                           ts_index;
@@ -52,7 +62,7 @@ typedef struct transcoder_stream {
   streaming_target_t           *ts_target;
   LIST_ENTRY(transcoder_stream) ts_link;
   int                           ts_first;
-
+  int                           ts_stages;
   pktbuf_t                     *ts_input_gh;
 
   void (*ts_handle_pkt) (struct transcoder *, struct transcoder_stream *, th_pkt_t *);
@@ -86,23 +96,61 @@ typedef struct audio_stream {
 
 } audio_stream_t;
 
+typedef struct avframes_pipeline {
+	AVFrame     **vid_frames;
+	int         pipeline_size;
+	int			push_pointer;
+	int			pop_pointer;
+	int 		num_of_frames_available;
+} avframes_pipeline_t;
+
+typedef struct tsAVFilterContext {
+	int i_width;
+	int i_height;
+	int o_width;
+	int o_height;
+	enum AVPixelFormat i_pix_fmt;
+	enum AVPixelFormat o_pix_fmt;
+	AVRational time_base;
+	AVRational sample_aspect_ratio;
+} tsAVFilterContext_t;
+
+struct video_stream;
+
+typedef struct video_stage {
+	struct video_stream 	*vs;
+	stage_type_t			 type;
+	struct video_stage      *prev;
+	struct video_stage      *next;
+	union stage {
+		struct decoder {
+			AVCodecContext			*vid_ictx;
+			AVCodec					*vid_icodec;
+    		AVPacket				packet;
+    		avframes_pipeline_t     *output_pipeline;
+		} decoder;
+		struct encoder {
+			AVCodecContext			*vid_octx;
+			AVCodec					*vid_ocodec;
+			AVPacket				packet;
+			avframes_pipeline_t     *input_pipeline;
+		} encoder;
+		struct filter {
+			AVFilterGraph           *flt_graph;
+			AVFilterContext         *flt_bufsinkctx;
+			AVFilterContext         *flt_bufsrcctx;
+			tsAVFilterContext_t      fctx;
+			avframes_pipeline_t     *input_pipeline;
+			avframes_pipeline_t     *output_pipeline;
+		} filter;
+	} *stage;
+	int number_of_stages;
+} video_stage_t;
 
 typedef struct video_stream {
   transcoder_stream_t;
 
-  AVCodecContext            *vid_ictx;
-  AVCodec                   *vid_icodec;
-
-  AVCodecContext            *vid_octx;
-  AVCodec                   *vid_ocodec;
-
-  AVFrame                   *vid_dec_frame;
-  AVFrame                   *vid_enc_frame;
-
-  AVFilterGraph             *flt_graph;
-  AVFilterContext           *flt_bufsrcctx;
-  AVFilterContext           *flt_bufsinkctx;
-
+  video_stage_t				 *video_stages;
   int16_t                    vid_width;
   int16_t                    vid_height;
 
@@ -1044,8 +1092,7 @@ send_video_packet(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt,
 
 /* create a simple deinterlacer-scaler video filter chain */
 static int
-create_video_filter(video_stream_t *vs, transcoder_t *t,
-                    AVCodecContext *ictx, AVCodecContext *octx)
+create_video_filter(struct filter *filter, transcoder_t *t)
 {
   AVFilterInOut *flt_inputs, *flt_outputs;
   AVFilter *flt_bufsrc, *flt_bufsink;
@@ -1057,11 +1104,11 @@ create_video_filter(video_stream_t *vs, transcoder_t *t,
   flt_inputs = flt_outputs = NULL;
   flt_bufsrc = flt_bufsink = NULL;
 
-  if (vs->flt_graph)
-    avfilter_graph_free(&vs->flt_graph);
+  if (filter->flt_graph)
+    avfilter_graph_free(&filter->flt_graph);
 
-  vs->flt_graph = avfilter_graph_alloc();
-  if (!vs->flt_graph)
+  filter->flt_graph = avfilter_graph_alloc();
+  if (!filter->flt_graph)
     return err;
 
   flt_inputs = avfilter_inout_alloc();
@@ -1081,30 +1128,34 @@ create_video_filter(video_stream_t *vs, transcoder_t *t,
 
   memset(opt, 0, sizeof(opt));
   snprintf(opt, sizeof(opt), "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-           ictx->width,
-           ictx->height,
-           ictx->pix_fmt,
-           ictx->time_base.num,
-           ictx->time_base.den,
-           ictx->sample_aspect_ratio.num,
-           ictx->sample_aspect_ratio.den);
+		   filter->fctx.i_width,
+           filter->fctx.i_height,
+           filter->fctx.i_pix_fmt,
+           filter->fctx.time_base.num,
+           filter->fctx.time_base.den,
+           filter->fctx.sample_aspect_ratio.num,
+           filter->fctx.sample_aspect_ratio.den);
 
-  err = avfilter_graph_create_filter(&vs->flt_bufsrcctx, flt_bufsrc, "in",
-                                     opt, NULL, vs->flt_graph);
+  err = avfilter_graph_create_filter(&filter->flt_bufsrcctx, flt_bufsrc, "in",
+                                     opt, NULL, filter->flt_graph);
   if (err < 0) {
     tvherror(LS_TRANSCODE, "%04X: fltchain IN init error", shortid(t));
     goto out_err;
   }
+  else
+	  tvhtrace(LS_TRANSCODE, "%04X: Filter: filtchain IN %s", shortid(t), opt);
 
-  err = avfilter_graph_create_filter(&vs->flt_bufsinkctx, flt_bufsink,
-                                     "out", NULL, NULL, vs->flt_graph);
+  err = avfilter_graph_create_filter(&filter->flt_bufsinkctx, flt_bufsink,
+                                     "out", NULL, NULL, filter->flt_graph);
   if (err < 0) {
     tvherror(LS_TRANSCODE, "%04X: fltchain OUT init error", shortid(t));
     goto out_err;
   }
+  else
+	  tvhtrace(LS_TRANSCODE, "%04X: Filter: filtchain IN out", shortid(t));
 
-  pix_fmts[0] = octx->pix_fmt;
-  err = av_opt_set_int_list(vs->flt_bufsinkctx, "pix_fmts", pix_fmts,
+  pix_fmts[0] = filter->fctx.o_pix_fmt;
+  err = av_opt_set_int_list(filter->flt_bufsinkctx, "pix_fmts", pix_fmts,
                             AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
   if (err < 0) {
     tvherror(LS_TRANSCODE, "%08X: fltchain cannot set output pixfmt",
@@ -1113,20 +1164,20 @@ create_video_filter(video_stream_t *vs, transcoder_t *t,
   }
 
   flt_outputs->name = av_strdup("in");
-  flt_outputs->filter_ctx = vs->flt_bufsrcctx;
+  flt_outputs->filter_ctx = filter->flt_bufsrcctx;
   flt_outputs->pad_idx = 0;
   flt_outputs->next = NULL;
   flt_inputs->name = av_strdup("out");
-  flt_inputs->filter_ctx = vs->flt_bufsinkctx;
+  flt_inputs->filter_ctx = filter->flt_bufsinkctx;
   flt_inputs->pad_idx = 0;
   flt_inputs->next = NULL;
 
   /* add filters: yadif to deinterlace and a scaler */
   memset(opt, 0, sizeof(opt));
   snprintf(opt, sizeof(opt), "yadif,scale=%dx%d",
-           octx->width,
-           octx->height);
-  err = avfilter_graph_parse_ptr(vs->flt_graph,
+		   filter->fctx.o_width,
+		   filter->fctx.o_height);
+  err = avfilter_graph_parse_ptr(filter->flt_graph,
                                  opt,
                                  &flt_inputs,
                                  &flt_outputs,
@@ -1136,7 +1187,7 @@ create_video_filter(video_stream_t *vs, transcoder_t *t,
     goto out_err;
   }
 
-  err = avfilter_graph_config(vs->flt_graph, NULL);
+  err = avfilter_graph_config(filter->flt_graph, NULL);
   if (err < 0) {
     tvherror(LS_TRANSCODE, "%04X: failed to config filter chain", shortid(t));
     goto out_err;
@@ -1152,9 +1203,9 @@ out_err:
     avfilter_inout_free(&flt_inputs);
   if (flt_outputs)
     avfilter_inout_free(&flt_outputs);
-  if (vs->flt_graph) {
-    avfilter_graph_free(&vs->flt_graph);
-    vs->flt_graph = NULL;
+  if (filter->flt_graph) {
+    avfilter_graph_free(&filter->flt_graph);
+    filter->flt_graph = NULL;
   }
 
   return err;
@@ -1169,27 +1220,63 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   AVCodec *icodec, *ocodec;
   AVCodecContext *ictx, *octx;
   AVDictionary *opts;
-  AVPacket packet, packet2;
-  int length, ret, got_picture, got_output, got_ref;
+  struct video_stage *stage;
+  struct decoder *decoder = NULL;
+  struct filter  *filter = NULL;
+  struct encoder *encoder = NULL;
+  int push, pop;
+  int length, ret, got_picture, got_output;
   video_stream_t *vs = (video_stream_t*)ts;
   streaming_message_t *sm;
   th_pkt_t *pkt2;
   static int max_bitrate = INT_MAX / ((3000*10)/8);
 
-  av_init_packet(&packet);
-  av_init_packet(&packet2);
-  packet2.data = NULL;
-  packet2.size = 0;
+  /*
+   * Encoder (last stage) pixel format is required to build the filter chain
+   * So it must be initialized before starting the transcoding queue
+   */
+  ocodec = vs->video_stages[vs->ts_stages-1].stage->encoder.vid_ocodec;
 
-  ictx = vs->vid_ictx;
-  octx = vs->vid_octx;
+  switch (ts->ts_type)
+  {
+  case SCT_MPEG2VIDEO:
+     if (!strcmp(ocodec->name, "nvenc") || !strcmp(ocodec->name, "mpeg2_qsv"))
+    	 vs->video_stages[vs->ts_stages-1].stage->encoder.vid_octx->pix_fmt    = AV_PIX_FMT_NV12;
+     else
+    	 vs->video_stages[vs->ts_stages-1].stage->encoder.vid_octx    = AV_PIX_FMT_YUV420P;
+  break;
 
-  icodec = vs->vid_icodec;
-  ocodec = vs->vid_ocodec;
+  case SCT_VP8:
+	  vs->video_stages[vs->ts_stages-1].stage->encoder.vid_octx->pix_fmt        = AV_PIX_FMT_YUV420P;
+  break;
+
+  case SCT_H264:
+     if (!strcmp(ocodec->name, "nvenc") || !strcmp(ocodec->name, "h264_qsv"))
+    	 vs->video_stages[vs->ts_stages-1].stage->encoder.vid_octx->pix_fmt    = AV_PIX_FMT_NV12;
+     else
+    	 vs->video_stages[vs->ts_stages-1].stage->encoder.vid_octx->pix_fmt    = AV_PIX_FMT_YUV420P;
+  break;
+
+  case SCT_HEVC:
+	  vs->video_stages[vs->ts_stages-1].stage->encoder.vid_octx->pix_fmt        = AV_PIX_FMT_YUV420P;
+  break;
+
+  default:
+  break;
+  }
+
+  icodec = vs->video_stages[0].stage->decoder.vid_icodec;
 
   opts = NULL;
 
-  got_ref = 0;
+  /*
+   * Get decoder handler and decode, this will become the decoder
+   * stage task body
+   */
+  stage = &vs->video_stages[0];
+  decoder = &stage->stage->decoder;
+
+  ictx = decoder->vid_ictx;
 
   if (!avcodec_is_open(ictx)) {
     if (icodec->id == AV_CODEC_ID_H264) {
@@ -1221,23 +1308,25 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
     vs->vid_first_sent = 1;
   }
 
-  packet.data     = pktbuf_ptr(pkt->pkt_payload);
-  packet.size     = pktbuf_len(pkt->pkt_payload);
-  packet.pts      = pkt->pkt_pts;
-  packet.dts      = pkt->pkt_dts;
-  packet.duration = pkt->pkt_duration;
+  av_init_packet(&decoder->packet);
 
-  vs->vid_enc_frame->pts = packet.pts;
-  vs->vid_enc_frame->pkt_dts = packet.dts;
-  vs->vid_enc_frame->pkt_pts = packet.pts;
+  decoder->packet.data     = pktbuf_ptr(pkt->pkt_payload);
+  decoder->packet.size     = pktbuf_len(pkt->pkt_payload);
+  decoder->packet.pts      = pkt->pkt_pts;
+  decoder->packet.dts      = pkt->pkt_dts;
+  decoder->packet.duration = pkt->pkt_duration;
 
-  vs->vid_dec_frame->pts = packet.pts;
-  vs->vid_dec_frame->pkt_dts = packet.dts;
-  vs->vid_dec_frame->pkt_pts = packet.pts;
+  push = decoder->output_pipeline->push_pointer;
 
-  ictx->reordered_opaque = packet.pts;
+  decoder->output_pipeline->vid_frames[push]->pts = decoder->packet.pts;
+  decoder->output_pipeline->vid_frames[push]->pkt_dts = decoder->packet.dts;
+  decoder->output_pipeline->vid_frames[push]->pkt_pts = decoder->packet.pts;
 
-  length = avcodec_decode_video2(ictx, vs->vid_dec_frame, &got_picture, &packet);
+  ictx->reordered_opaque = decoder->packet.pts;
+
+  tvhtrace(LS_TRANSCODE, "%04X: Decode: out push %d, ictx 0x%x", shortid(t), push, (unsigned int)ictx);
+
+  length = avcodec_decode_video2(ictx, decoder->output_pipeline->vid_frames[push], &got_picture, &decoder->packet);
   if (length <= 0) {
     if (length == AVERROR_INVALIDDATA) goto cleanup;
     tvherror(LS_TRANSCODE, "%04X: Unable to decode video (%d, %s)",
@@ -1246,246 +1335,413 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   }
 
   if (!got_picture)
-    goto cleanup;
-
-  got_ref = 1;
-
-  octx->sample_aspect_ratio.num = ictx->sample_aspect_ratio.num;
-  octx->sample_aspect_ratio.den = ictx->sample_aspect_ratio.den;
-
-  vs->vid_enc_frame->sample_aspect_ratio.num = vs->vid_dec_frame->sample_aspect_ratio.num;
-  vs->vid_enc_frame->sample_aspect_ratio.den = vs->vid_dec_frame->sample_aspect_ratio.den;
-
-  if(!avcodec_is_open(octx)) {
-    // Common settings
-    octx->width           = vs->vid_width  ? vs->vid_width  : ictx->width;
-    octx->height          = vs->vid_height ? vs->vid_height : ictx->height;
-
-    // Encoder uses "time_base" for bitrate calculation, but "time_base" from decoder
-    // will be deprecated in the future, therefore calculate "time_base" from "framerate" if available.
-    octx->ticks_per_frame = ictx->ticks_per_frame;
-    if (ictx->framerate.num == 0) {
-      ictx->framerate.num = 30;
-      ictx->framerate.den = 1;
-    }
-    if (ictx->time_base.num == 0) {
-      ictx->time_base.num = ictx->framerate.den;
-      ictx->time_base.den = ictx->framerate.num;
-    }
-    octx->framerate = ictx->framerate;
-#if LIBAVCODEC_VERSION_MICRO >= 100 && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(56, 13, 100) // ffmpeg 2.5
-    octx->time_base       = av_inv_q(av_mul_q(ictx->framerate, av_make_q(ictx->ticks_per_frame, 1)));
-#else
-    octx->time_base       = ictx->time_base;
-#endif
-
-    // set default gop size to 1 second
-    octx->gop_size        = ceil(av_q2d(av_inv_q(av_div_q(octx->time_base, (AVRational){1, octx->ticks_per_frame}))));
-
-    switch (ts->ts_type) {
-    case SCT_MPEG2VIDEO:
-       if (!strcmp(ocodec->name, "nvenc") || !strcmp(ocodec->name, "mpeg2_qsv"))
-          octx->pix_fmt    = AV_PIX_FMT_NV12;
-      else
-          octx->pix_fmt    = AV_PIX_FMT_YUV420P;
-
-      octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
-
-      if (t->t_props.tp_vbitrate < 64) {
-        // encode with specified quality and optimize for low latency
-        // valid values for quality are 2-31, smaller means better quality, use 5 as default
-        octx->flags          |= CODEC_FLAG_QSCALE;
-        octx->global_quality  = FF_QP2LAMBDA *
-            (t->t_props.tp_vbitrate == 0 ? 5 : MINMAX(t->t_props.tp_vbitrate, 2, 31));
-      } else {
-        // encode with specified bitrate and optimize for high compression
-        octx->bit_rate        = t->t_props.tp_vbitrate * 1000;
-        octx->rc_max_rate     = ceil(octx->bit_rate * 1.25);
-        octx->rc_buffer_size  = octx->rc_max_rate * 3;
-        // use gop size of 5 seconds
-        octx->gop_size       *= 5;
-        // activate b-frames
-        octx->max_b_frames    = 3;
-      }
-
-      break;
-
-    case SCT_VP8:
-      octx->pix_fmt        = AV_PIX_FMT_YUV420P;
-
-      // setting quality to realtime will use as much CPU for transcoding as possible,
-      // while still encoding in realtime
-      av_dict_set(&opts, "quality", "realtime", 0);
-
-      if (t->t_props.tp_vbitrate < 64) {
-        // encode with specified quality and optimize for low latency
-        // valid values for quality are 1-63, smaller means better quality, use 15 as default
-        av_dict_set_int__(&opts,      "crf", t->t_props.tp_vbitrate == 0 ? 15 : t->t_props.tp_vbitrate, 0);
-        // bitrate setting is still required, as it's used as max rate in CQ mode
-        // and set to a very low value by default
-        octx->bit_rate        = 25000000;
-      } else {
-        // encode with specified bitrate and optimize for high compression
-        octx->bit_rate        = t->t_props.tp_vbitrate * 1000;
-        octx->rc_buffer_size  = octx->bit_rate * 3;
-        // use gop size of 5 seconds
-        octx->gop_size       *= 5;
-      }
-
-      break;
-
-    case SCT_H264:
-       if (!strcmp(ocodec->name, "nvenc") || !strcmp(ocodec->name, "h264_qsv"))
-          octx->pix_fmt    = AV_PIX_FMT_NV12;
-      else
-          octx->pix_fmt    = AV_PIX_FMT_YUV420P;
-
-      octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
-
-      // Default = "medium". We gain more encoding speed compared to the loss of quality when lowering it _slightly_.
-      // select preset according to system performance and codec type
-      av_dict_set(&opts, "preset",  t->t_props.tp_vcodec_preset, 0);
-      tvhinfo(LS_TRANSCODE, "%04X: Using preset %s", shortid(t), t->t_props.tp_vcodec_preset);
-
-      // All modern devices should support "high" profile
-      av_dict_set(&opts, "profile", "high", 0);
-
-      if (t->t_props.tp_vbitrate < 64) {
-        // encode with specified quality and optimize for low latency
-        // valid values for quality are 1-51, smaller means better quality, use 15 as default
-        av_dict_set_int__(&opts,      "crf", t->t_props.tp_vbitrate == 0 ? 15 : MIN(51, t->t_props.tp_vbitrate), 0);
-        // tune "zerolatency" removes as much encoder latency as possible
-        av_dict_set(&opts,      "tune", "zerolatency", 0);
-      } else {
-        // encode with specified bitrate and optimize for high compression
-        octx->bit_rate        = t->t_props.tp_vbitrate * 1000;
-        octx->rc_max_rate     = ceil(octx->bit_rate * 1.25);
-        octx->rc_buffer_size  = octx->rc_max_rate * 3;
-        // force-cfr=1 is needed for correct bitrate calculation (tune "zerolatency" also sets this)
-        av_dict_set(&opts,      "x264opts", "force-cfr=1", 0);
-        // use gop size of 5 seconds
-        octx->gop_size       *= 5;
-      }
-
-      break;
-
-    case SCT_HEVC:
-      octx->pix_fmt        = AV_PIX_FMT_YUV420P;
-      octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
-
-      // on all hardware ultrafast (or maybe superfast) should be safe
-      // select preset according to system performance
-      av_dict_set(&opts, "preset",  t->t_props.tp_vcodec_preset, 0);
-      tvhinfo(LS_TRANSCODE, "%04X: Using preset %s", shortid(t), t->t_props.tp_vcodec_preset);
-
-      // disables encoder features which tend to be bottlenecks for the decoder/player
-      av_dict_set(&opts, "tune",   "fastdecode", 0);
-
-      if (t->t_props.tp_vbitrate < 64) {
-        // encode with specified quality
-        // valid values for crf are 1-51, smaller means better quality
-        // use 18 as default
-        av_dict_set_int__(&opts, "crf", t->t_props.tp_vbitrate == 0 ? 18 : MIN(51, t->t_props.tp_vbitrate), 0);
-
-        // the following is equivalent to tune=zerolatency for presets: ultra/superfast
-        av_dict_set(&opts, "x265-params", "bframes=0",        0);
-        av_dict_set(&opts, "x265-params", ":rc-lookahead=0",  AV_DICT_APPEND);
-        av_dict_set(&opts, "x265-params", ":scenecut=0",      AV_DICT_APPEND);
-        av_dict_set(&opts, "x265-params", ":frame-threads=1", AV_DICT_APPEND);
-      } else {
-        int bitrate, maxrate, bufsize;
-        bitrate = (t->t_props.tp_vbitrate > max_bitrate) ? max_bitrate : t->t_props.tp_vbitrate;
-        maxrate = ceil(bitrate * 1.25);
-        bufsize = maxrate * 3;
-
-        tvhdebug(LS_TRANSCODE, "tuning HEVC encoder for ABR rate control, "
-                 "bitrate: %dkbps, vbv-bufsize: %dkbits, vbv-maxrate: %dkbps",
-                 bitrate, bufsize, maxrate);
-
-        // this is the same as setting --bitrate=bitrate
-        octx->bit_rate = bitrate * 1000;
-
-        av_dict_set(&opts,       "x265-params", "vbv-bufsize=",  0);
-        av_dict_set_int__(&opts, "x265-params", bufsize,         AV_DICT_APPEND);
-        av_dict_set(&opts,       "x265-params", ":vbv-maxrate=", AV_DICT_APPEND);
-        av_dict_set_int__(&opts, "x265-params", maxrate,         AV_DICT_APPEND);
-        av_dict_set(&opts,       "x265-params", ":strict-cbr=1", AV_DICT_APPEND);
-      }
-      // reduce key frame interface for live streaming
-      av_dict_set(&opts, "x265-params", ":keyint=49:min-keyint=15", AV_DICT_APPEND);
-
-      break;
-
-    default:
-      break;
-    }
-
-    if (avcodec_open2(octx, ocodec, &opts) < 0) {
-      tvherror(LS_TRANSCODE, "%04X: Unable to open %s encoder",
-               shortid(t), ocodec->name);
-      transcoder_stream_invalidate(ts);
+  {
       goto cleanup;
-    }
-
-    if (create_video_filter(vs, t, ictx, octx)) {
-      tvherror(LS_TRANSCODE, "%04X: Video filter creation failed",
-               shortid(t));
-      transcoder_stream_invalidate(ts);
-      goto cleanup;
-    }
   }
+  else
+  {
+	  tvhtrace(LS_TRANSCODE, "%04X: Decoder: available output buffer %d", shortid(t), decoder->output_pipeline->push_pointer);
+	  decoder->output_pipeline->push_pointer++;
 
-  /* push decoded frame into filter chain */
-  if (av_buffersrc_add_frame(vs->flt_bufsrcctx, vs->vid_dec_frame) < 0) {
-    tvherror(LS_TRANSCODE, "%04X: filter input error", shortid(t));
-    transcoder_stream_invalidate(ts);
-    goto cleanup;
+	  if(decoder->output_pipeline->push_pointer >= decoder->output_pipeline->pipeline_size)
+		  decoder->output_pipeline->push_pointer = 0;
+
+	  /*
+	   * Got a picture, set the encoder (last stage) context based on the first decoded picture
+	   * context
+	   */
+	  encoder = &vs->video_stages[vs->ts_stages-1].stage->encoder;
+
+	  encoder->vid_octx->sample_aspect_ratio.num = ictx->sample_aspect_ratio.num;
+	  encoder->vid_octx->sample_aspect_ratio.den = ictx->sample_aspect_ratio.den;
+
+	  encoder->vid_octx->width           = vs->vid_width  ? vs->vid_width  : ictx->width;
+	  encoder->vid_octx->height          = vs->vid_height ? vs->vid_height : ictx->height;
+
+	  // Encoder uses "time_base" for bitrate calculation, but "time_base" from decoder
+	  // will be deprecated in the future, therefore calculate "time_base" from "framerate" if available.
+	  encoder->vid_octx->ticks_per_frame = ictx->ticks_per_frame;
+	  if (ictx->framerate.num == 0) {
+	      ictx->framerate.num = 30;
+	      ictx->framerate.den = 1;
+	  }
+	  if (ictx->time_base.num == 0) {
+	    ictx->time_base.num = ictx->framerate.den;
+	    ictx->time_base.den = ictx->framerate.num;
+	  }
+	  encoder->vid_octx->framerate = ictx->framerate;
+	#if LIBAVCODEC_VERSION_MICRO >= 100 && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(56, 13, 100) // ffmpeg 2.5
+	  encoder->vid_octx->time_base       = av_inv_q(av_mul_q(ictx->framerate, av_make_q(ictx->ticks_per_frame, 1)));
+	#else
+	  encoder->vid_octx->time_base       = ictx->time_base;
+	#endif
   }
+  /*
+   * Get filter handler and filter, this will become the decoder
+   * stage task body
+   */
+  encoder = NULL;
+  stage = &vs->video_stages[1];
+  filter = &stage->stage->filter;
 
-  /* and pull out a filtered frame */
+  pop = filter->input_pipeline->pop_pointer;
+
+  if(pop != filter->input_pipeline->push_pointer)
+  {
+	  tvhtrace(LS_TRANSCODE, "%04X: Filter: available input buffer %d", shortid(t), pop);
+
+	  filter->input_pipeline->pop_pointer++;
+
+	  if(filter->input_pipeline->pop_pointer >= filter->input_pipeline->pipeline_size)
+		  filter->input_pipeline->pop_pointer = 0;
+
+	  if(filter->flt_graph == NULL)
+	  {
+		  tvhtrace(LS_TRANSCODE, "%04X: Filter: create filter", shortid(t));
+
+		  if(stage->prev == NULL )
+		  {
+			  tvherror(LS_TRANSCODE, "%04X: Video filter stage must have a previus stage, found NULL",
+	             shortid(t));
+			  transcoder_stream_invalidate(ts);
+			  goto cleanup;
+		  }
+
+		  if(stage->next == NULL )
+		  {
+			  tvherror(LS_TRANSCODE, "%04X: Video filter stage must have a next stage, found NULL",
+	             shortid(t));
+			  transcoder_stream_invalidate(ts);
+			  goto cleanup;
+		  }
+
+		  if(stage->prev->type == TS_DECODER_STAGE)
+		  {
+			  filter->fctx.i_width = stage->prev->stage->decoder.vid_ictx->width;
+			  filter->fctx.i_height = stage->prev->stage->decoder.vid_ictx->height;
+
+			  filter->fctx.sample_aspect_ratio.num = stage->prev->stage->decoder.vid_ictx->sample_aspect_ratio.num;
+			  filter->fctx.sample_aspect_ratio.den = stage->prev->stage->decoder.vid_ictx->sample_aspect_ratio.den;
+			  filter->fctx.time_base.num = stage->prev->stage->decoder.vid_ictx->time_base.num;
+			  filter->fctx.time_base.den = stage->prev->stage->decoder.vid_ictx->time_base.den;
+			  filter->fctx.i_pix_fmt = stage->prev->stage->decoder.vid_ictx->pix_fmt;
+			  tvhtrace(LS_TRANSCODE, "%04X: Filter: create filter context base on decoder info", shortid(t));
+		  }
+		  else if(stage->prev->type == TS_FILTER_STAGE)
+		  {
+			  filter->fctx.i_width = stage->prev->stage->filter.fctx.o_width;
+			  filter->fctx.i_height = stage->prev->stage->filter.fctx.o_height;
+
+			  filter->fctx.sample_aspect_ratio.num = stage->prev->stage->filter.fctx.sample_aspect_ratio.num;
+			  filter->fctx.sample_aspect_ratio.den = stage->prev->stage->filter.fctx.sample_aspect_ratio.den;
+			  filter->fctx.time_base.num = stage->prev->stage->filter.fctx.time_base.num;
+			  filter->fctx.time_base.den = stage->prev->stage->filter.fctx.time_base.den;
+			  filter->fctx.i_pix_fmt = stage->prev->stage->filter.fctx.o_pix_fmt;
+			  tvhtrace(LS_TRANSCODE, "%04X: Filter: create filter context base on filter info", shortid(t));
+		  }
+		  else
+		  {
+			  tvherror(LS_TRANSCODE, "%04X: Video filter previous stage can be decoder or filter, found %d",
+	             shortid(t), stage->prev->type);
+			  transcoder_stream_invalidate(ts);
+			  goto cleanup;
+		  }
+
+		  if(stage->next->type == TS_ENCODER_STAGE)
+		  {
+			  filter->fctx.o_pix_fmt = stage->next->stage->encoder.vid_octx->pix_fmt;
+			  filter->fctx.o_width   = stage->next->stage->encoder.vid_octx->width;
+			  filter->fctx.o_height   = stage->next->stage->encoder.vid_octx->height;
+			  tvhtrace(LS_TRANSCODE, "%04X:         and encoder info", shortid(t));
+		  }
+		  else if(stage->prev->type == TS_FILTER_STAGE)
+		  {
+			  filter->fctx.o_pix_fmt = filter->fctx.i_pix_fmt;
+			  filter->fctx.o_width   = filter->fctx.i_width;
+			  filter->fctx.o_height  = filter->fctx.i_width;
+			  tvhtrace(LS_TRANSCODE, "%04X:         and filter info", shortid(t));
+		  }
+		  else
+		  {
+			  tvherror(LS_TRANSCODE, "%04X: Video filter next stage can be encoder or filter, found %d",
+	             shortid(t), stage->next->type);
+			  transcoder_stream_invalidate(ts);
+			  goto cleanup;
+		  }
+
+		  tvhtrace(LS_TRANSCODE, "%04X:         i_width %d, i_height %d", shortid(t), filter->fctx.i_width, filter->fctx.i_height);
+		  tvhtrace(LS_TRANSCODE, "%04X:         o_width %d, o_height %d", shortid(t), filter->fctx.o_width, filter->fctx.o_height);
+		  tvhtrace(LS_TRANSCODE, "%04X:         sar.num %d, dar.den %d", shortid(t), filter->fctx.sample_aspect_ratio.num, filter->fctx.sample_aspect_ratio.den);
+		  tvhtrace(LS_TRANSCODE, "%04X:         tb.num %d, tb.den %d", shortid(t), filter->fctx.time_base.num, filter->fctx.time_base.den);
+		  tvhtrace(LS_TRANSCODE, "%04X:         input pixel format %s", shortid(t), av_get_pix_fmt_name(filter->fctx.i_pix_fmt));
+		  tvhtrace(LS_TRANSCODE, "%04X:         output pixel format %s", shortid(t), av_get_pix_fmt_name(filter->fctx.o_pix_fmt));
+
+		  if (create_video_filter(filter, t)) {
+			  tvherror(LS_TRANSCODE, "%04X: Video filter creation failed",
+	             shortid(t));
+			  transcoder_stream_invalidate(ts);
+			  goto cleanup;
+		  }
+	  }
+	  /*
+	   * One frame ready in the pipeline, filter it
+	   */
+	  push = filter->output_pipeline->push_pointer;
+	  filter->output_pipeline->vid_frames[push]->pts = filter->input_pipeline->vid_frames[pop]->pts;
+	  filter->output_pipeline->vid_frames[push]->pkt_dts = filter->input_pipeline->vid_frames[pop]->pkt_dts;
+	  filter->output_pipeline->vid_frames[push]->pkt_pts = filter->input_pipeline->vid_frames[pop]->pkt_pts;
+	  filter->output_pipeline->vid_frames[push]->sample_aspect_ratio.num = filter->input_pipeline->vid_frames[pop]->sample_aspect_ratio.num;
+	  filter->output_pipeline->vid_frames[push]->sample_aspect_ratio.den = filter->input_pipeline->vid_frames[pop]->sample_aspect_ratio.den;
+
+
+	  /* push decoded frame into filter chain */
+	  if (av_buffersrc_add_frame(filter->flt_bufsrcctx, filter->input_pipeline->vid_frames[pop]) < 0) {
+	      tvherror(LS_TRANSCODE, "%04X: filter input error", shortid(t));
+	      transcoder_stream_invalidate(ts);
+	      goto cleanup;
+	  }
+
+	  /* and pull out a filtered frame */
+	  while (1)
+	  {
+  		  ret = av_buffersink_get_frame(filter->flt_bufsinkctx, filter->output_pipeline->vid_frames[push]);
+
+  		  if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+			break;
+
+  		  if (ret < 0)
+  		  {
+			  tvherror(LS_TRANSCODE, "%04X: filter output error", shortid(t));
+			  transcoder_stream_invalidate(ts);
+			  goto cleanup;
+		  }
+
+	      filter->output_pipeline->vid_frames[push]->format  = filter->fctx.o_pix_fmt;
+	      filter->output_pipeline->vid_frames[push]->width   = filter->fctx.o_width;
+	      filter->output_pipeline->vid_frames[push]->height  = filter->fctx.o_height;
+	      filter->output_pipeline->vid_frames[push]->pkt_dts = filter->input_pipeline->vid_frames[pop]->pkt_dts;
+          filter->output_pipeline->vid_frames[push]->pkt_pts = filter->input_pipeline->vid_frames[pop]->pkt_pts;
+
+    	  if (filter->input_pipeline->vid_frames[pop]->reordered_opaque != AV_NOPTS_VALUE)
+	    	  filter->output_pipeline->vid_frames[push]->pts = filter->input_pipeline->vid_frames[pop]->reordered_opaque;
+	      else if (stage->prev->type == TS_DECODER_STAGE && stage->prev->stage->decoder.vid_ictx->coded_frame &&
+			       stage->prev->stage->decoder.vid_ictx->coded_frame->pts != AV_NOPTS_VALUE)
+		  	  filter->output_pipeline->vid_frames[push]->pts = filter->input_pipeline->vid_frames[pop]->pts;
+
+    	  tvhtrace(LS_TRANSCODE, "%04X: Filter: available output buffer %d, %x", shortid(t), filter->output_pipeline->push_pointer,
+    			  (unsigned int)filter->output_pipeline->vid_frames[push]);
+
+    	  tvhtrace(LS_TRANSCODE, "%04X:         Output frame %x width %d, height %d", shortid(t), (unsigned int)filter->output_pipeline->vid_frames[push],
+    			  filter->output_pipeline->vid_frames[push]->width, filter->output_pipeline->vid_frames[push]->height);
+    	  tvhtrace(LS_TRANSCODE, "%04X:         Output frame format %s", shortid(t),
+    			  av_get_pix_fmt_name(filter->output_pipeline->vid_frames[push]->format));
+
+          av_frame_unref(filter->input_pipeline->vid_frames[pop]);
+
+    	  filter->output_pipeline->push_pointer++;
+
+    	  if(filter->output_pipeline->push_pointer >= filter->output_pipeline->pipeline_size)
+    		  filter->output_pipeline->push_pointer = 0;
+
+	  }
+  }
+  else
+	  tvhtrace(LS_TRANSCODE, "%04X: Filter: no available input buffer", shortid(t));
+
+  stage = &vs->video_stages[2];
+  encoder = &stage->stage->encoder;
   got_output = 0;
-  while (1) {
-	ret = av_buffersink_get_frame(vs->flt_bufsinkctx, vs->vid_enc_frame);
-	if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-		break;
-	if (ret < 0) {
-		tvherror(LS_TRANSCODE, "%04X: filter output error", shortid(t));
-		transcoder_stream_invalidate(ts);
-		goto cleanup;
-	}
 
-	vs->vid_enc_frame->format  = octx->pix_fmt;
-	vs->vid_enc_frame->width   = octx->width;
-	vs->vid_enc_frame->height  = octx->height;
+  av_init_packet(&encoder->packet);
+  encoder->packet.data = NULL;
+  encoder->packet.size = 0;
 
-	vs->vid_enc_frame->pkt_pts = vs->vid_dec_frame->pkt_pts;
-	vs->vid_enc_frame->pkt_dts = vs->vid_dec_frame->pkt_dts;
+  octx = encoder->vid_octx;
 
-	if (vs->vid_dec_frame->reordered_opaque != AV_NOPTS_VALUE)
-		vs->vid_enc_frame->pts = vs->vid_dec_frame->reordered_opaque;
+  if(!avcodec_is_open(octx))
+  {
+      // set default gop size to 1 second
+	  octx->gop_size        = ceil(av_q2d(av_inv_q(av_div_q(octx->time_base, (AVRational){1, octx->ticks_per_frame}))));
 
-	else if (ictx->coded_frame && ictx->coded_frame->pts != AV_NOPTS_VALUE)
-		vs->vid_enc_frame->pts = vs->vid_dec_frame->pts;
+	  switch (ts->ts_type)
+	  {
+	  case SCT_MPEG2VIDEO:
+		  octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
 
-	ret = avcodec_encode_video2(octx, &packet2, vs->vid_enc_frame, &got_output);
-	if (ret < 0) {
-		tvherror(LS_TRANSCODE, "%04X: Error encoding frame", shortid(t));
-		transcoder_stream_invalidate(ts);
-		goto cleanup;
-	}
-	av_frame_unref(vs->vid_enc_frame);
+		  if (t->t_props.tp_vbitrate < 64) {
+			  // encode with specified quality and optimize for low latency
+			  // valid values for quality are 2-31, smaller means better quality, use 5 as default
+			  octx->flags          |= CODEC_FLAG_QSCALE;
+			  octx->global_quality  = FF_QP2LAMBDA *
+					  (t->t_props.tp_vbitrate == 0 ? 5 : MINMAX(t->t_props.tp_vbitrate, 2, 31));
+		  }
+		  else
+		  {
+			  // encode with specified bitrate and optimize for high compression
+			  octx->bit_rate        = t->t_props.tp_vbitrate * 1000;
+			  octx->rc_max_rate     = ceil(octx->bit_rate * 1.25);
+			  octx->rc_buffer_size  = octx->rc_max_rate * 3;
+			  // use gop size of 5 seconds
+			  octx->gop_size       *= 5;
+			  // activate b-frames
+			  octx->max_b_frames    = 3;
+		  }
+
+      break;
+
+	  case SCT_VP8:
+		  // setting quality to realtime will use as much CPU for transcoding as possible,
+		  // while still encoding in realtime
+		  av_dict_set(&opts, "quality", "realtime", 0);
+
+		  if (t->t_props.tp_vbitrate < 64) {
+			  // encode with specified quality and optimize for low latency
+			  // valid values for quality are 1-63, smaller means better quality, use 15 as default
+			  av_dict_set_int__(&opts,      "crf", t->t_props.tp_vbitrate == 0 ? 15 : t->t_props.tp_vbitrate, 0);
+			  // bitrate setting is still required, as it's used as max rate in CQ mode
+			  // and set to a very low value by default
+			  octx->bit_rate        = 25000000;
+		  }
+		  else
+		  {
+			  // encode with specified bitrate and optimize for high compression
+			  octx->bit_rate        = t->t_props.tp_vbitrate * 1000;
+			  octx->rc_buffer_size  = octx->bit_rate * 3;
+			  // use gop size of 5 seconds
+			  octx->gop_size       *= 5;
+		  }
+      break;
+
+	  case SCT_H264:
+		  octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
+
+		  // Default = "medium". We gain more encoding speed compared to the loss of quality when lowering it _slightly_.
+		  // select preset according to system performance and codec type
+		  av_dict_set(&opts, "preset",  t->t_props.tp_vcodec_preset, 0);
+		  tvhinfo(LS_TRANSCODE, "%04X: Using preset %s", shortid(t), t->t_props.tp_vcodec_preset);
+
+		  // All modern devices should support "high" profile
+		  if(strcmp(ocodec->name, "h264_omx") != 0)
+			  av_dict_set(&opts, "profile", "high", 0);
+
+		  if (t->t_props.tp_vbitrate < 64) {
+			  // encode with specified quality and optimize for low latency
+			  // valid values for quality are 1-51, smaller means better quality, use 15 as default
+			  av_dict_set_int__(&opts,      "crf", t->t_props.tp_vbitrate == 0 ? 15 : MIN(51, t->t_props.tp_vbitrate), 0);
+			  // tune "zerolatency" removes as much encoder latency as possible
+			  av_dict_set(&opts,      "tune", "zerolatency", 0);
+		  }
+		  else
+		  {
+			  // encode with specified bitrate and optimize for high compression
+			  octx->bit_rate        = t->t_props.tp_vbitrate * 1000;
+			  octx->rc_max_rate     = ceil(octx->bit_rate * 1.25);
+			  octx->rc_buffer_size  = octx->rc_max_rate * 3;
+			  // force-cfr=1 is needed for correct bitrate calculation (tune "zerolatency" also sets this)
+			  av_dict_set(&opts,      "x264opts", "force-cfr=1", 0);
+			  // use gop size of 5 seconds
+			  octx->gop_size       *= 5;
+		  }
+      break;
+
+	  case SCT_HEVC:
+		  // on all hardware ultrafast (or maybe superfast) should be safe
+		  // select preset according to system performance
+		  av_dict_set(&opts, "preset",  t->t_props.tp_vcodec_preset, 0);
+		  tvhinfo(LS_TRANSCODE, "%04X: Using preset %s", shortid(t), t->t_props.tp_vcodec_preset);
+
+		  // disables encoder features which tend to be bottlenecks for the decoder/player
+		  av_dict_set(&opts, "tune",   "fastdecode", 0);
+
+		  if (t->t_props.tp_vbitrate < 64) {
+			  // encode with specified quality
+			  // valid values for crf are 1-51, smaller means better quality
+			  // use 18 as default
+			  av_dict_set_int__(&opts, "crf", t->t_props.tp_vbitrate == 0 ? 18 : MIN(51, t->t_props.tp_vbitrate), 0);
+
+			  // the following is equivalent to tune=zerolatency for presets: ultra/superfast
+			  av_dict_set(&opts, "x265-params", "bframes=0",        0);
+			  av_dict_set(&opts, "x265-params", ":rc-lookahead=0",  AV_DICT_APPEND);
+			  av_dict_set(&opts, "x265-params", ":scenecut=0",      AV_DICT_APPEND);
+			  av_dict_set(&opts, "x265-params", ":frame-threads=1", AV_DICT_APPEND);
+		  }
+		  else
+		  {
+			  int bitrate, maxrate, bufsize;
+			  bitrate = (t->t_props.tp_vbitrate > max_bitrate) ? max_bitrate : t->t_props.tp_vbitrate;
+			  maxrate = ceil(bitrate * 1.25);
+			  bufsize = maxrate * 3;
+
+			  tvhdebug(LS_TRANSCODE, "tuning HEVC encoder for ABR rate control, "
+					  "bitrate: %dkbps, vbv-bufsize: %dkbits, vbv-maxrate: %dkbps",
+					  bitrate, bufsize, maxrate);
+
+			  // this is the same as setting --bitrate=bitrate
+			  octx->bit_rate = bitrate * 1000;
+
+			  av_dict_set(&opts,       "x265-params", "vbv-bufsize=",  0);
+			  av_dict_set_int__(&opts, "x265-params", bufsize,         AV_DICT_APPEND);
+			  av_dict_set(&opts,       "x265-params", ":vbv-maxrate=", AV_DICT_APPEND);
+			  av_dict_set_int__(&opts, "x265-params", maxrate,         AV_DICT_APPEND);
+			  av_dict_set(&opts,       "x265-params", ":strict-cbr=1", AV_DICT_APPEND);
+		  }
+		  // reduce key frame interface for live streaming
+		  av_dict_set(&opts, "x265-params", ":keyint=49:min-keyint=15", AV_DICT_APPEND);
+      break;
+
+	  default:
+      break;
+	  }
+
+	  if (avcodec_open2(octx, ocodec, &opts) < 0)
+	  {
+		  tvherror(LS_TRANSCODE, "%04X: Unable to open %s encoder",
+               shortid(t), ocodec->name);
+		  transcoder_stream_invalidate(ts);
+		  goto cleanup;
+	  }
   }
+
+  pop = encoder->input_pipeline->pop_pointer;
+  if(pop != encoder->input_pipeline->push_pointer)
+  {
+  	  tvhtrace(LS_TRANSCODE, "%04X: Encoder: available input buffer %d", shortid(t), pop);
+
+	  /*
+ 	   * One frame available out from the filter chain, encode it
+	   */
+	  encoder->input_pipeline->pop_pointer++;
+
+	  if(encoder->input_pipeline->pop_pointer >= encoder->input_pipeline->pipeline_size)
+		  encoder->input_pipeline->pop_pointer = 0;
+
+	  tvhtrace(LS_TRANSCODE, "%04X:          Input frame %x width %d, height %d", shortid(t), (unsigned int)encoder->input_pipeline->vid_frames[pop],
+			  encoder->input_pipeline->vid_frames[pop]->width, encoder->input_pipeline->vid_frames[pop]->height);
+	  tvhtrace(LS_TRANSCODE, "%04X:          Input frame format %s", shortid(t),
+			  av_get_pix_fmt_name(encoder->input_pipeline->vid_frames[pop]->format));
+
+	  ret = avcodec_encode_video2(octx, &encoder->packet, encoder->input_pipeline->vid_frames[pop], &got_output);
+	  if (ret < 0) {
+		  tvherror(LS_TRANSCODE, "%04X: Error encoding frame", shortid(t));
+		  transcoder_stream_invalidate(ts);
+		  goto cleanup;
+	  }
+
+	  av_frame_unref(encoder->input_pipeline->vid_frames[pop]);
+  }
+  else
+	  tvhtrace(LS_TRANSCODE, "%04X: Encoder: no available input buffer", shortid(t));
 
   if (got_output)
-    send_video_packet(t, ts, pkt, &packet2, octx);
+    send_video_packet(t, ts, pkt, &encoder->packet, octx);
 
- cleanup:
-  if (got_ref)
-    av_frame_unref(vs->vid_dec_frame);
+cleanup:
 
-  av_free_packet(&packet2);
+  if(encoder)
+	  av_free_packet(&encoder->packet);
 
-  av_free_packet(&packet);
+  if(decoder)
+	  av_free_packet(&decoder->packet);
 
   if(opts)
     av_dict_free(&opts);
@@ -1759,33 +2015,71 @@ transcoder_init_audio(transcoder_t *t, streaming_start_component_t *ssc)
 static void
 transcoder_destroy_video(transcoder_t *t, transcoder_stream_t *ts)
 {
+  int i, k, j;
   video_stream_t *vs = (video_stream_t*)ts;
 
-  if(vs->vid_ictx) {
-    av_freep(&vs->vid_ictx->extradata);
-    vs->vid_ictx->extradata_size = 0;
-    avcodec_close(vs->vid_ictx);
-    av_free(vs->vid_ictx);
+  if(vs->video_stages)
+  {
+	  for(i = 0; i < vs->ts_stages; i++)
+	  {
+	    if(vs->video_stages[i].type == TS_DECODER_STAGE)
+	    {
+	    	av_freep(&vs->video_stages[i].stage->decoder.vid_ictx->extradata);
+	    	vs->video_stages[i].stage->decoder.vid_ictx->extradata = 0;
+	    	avcodec_close(vs->video_stages[i].stage->decoder.vid_ictx);
+	    	av_free(vs->video_stages[i].stage->decoder.vid_ictx);
+
+	    	if(vs->video_stages[i].stage->decoder.output_pipeline)
+	    	{
+	    		for(k = 0; k < vs->ts_stages; k++)
+	    		{
+	    			if(vs->video_stages[i].stage->decoder.output_pipeline->vid_frames[k])
+	    				av_free(vs->video_stages[i].stage->decoder.output_pipeline->vid_frames[k]);
+	    		}
+	    		free(vs->video_stages[i].stage->decoder.output_pipeline->vid_frames);
+	    		free(vs->video_stages[i].stage->decoder.output_pipeline);
+	    	}
+
+	    	free(vs->video_stages[i].stage);
+	    }
+
+	    if(vs->video_stages[i].type == TS_FILTER_STAGE)
+	    {
+	    	for(j = 0; j < vs->video_stages[i].number_of_stages; j++)
+	    	{
+		    	if(vs->video_stages[i].stage[j].filter.output_pipeline)
+		    	{
+		    		for(k = 0; k < vs->ts_stages; k++)
+		    		{
+		    			if(vs->video_stages[i].stage[j].filter.output_pipeline->vid_frames[k])
+		    				av_free(vs->video_stages[i].stage[j].filter.output_pipeline->vid_frames[k]);
+		    		}
+		    		free(vs->video_stages[i].stage[j].filter.output_pipeline->vid_frames);
+		    		free(vs->video_stages[i].stage[j].filter.output_pipeline);
+		    	}
+
+		    	if (vs->video_stages[i].stage[j].filter.flt_graph)
+		    	{
+		    	    avfilter_graph_free(&vs->video_stages[i].stage[j].filter.flt_graph);
+		    	    vs->video_stages[i].stage[j].filter.flt_graph = NULL;
+		    	}
+	    	}
+	    	free(vs->video_stages[i].stage);
+	    }
+
+	    if(vs->video_stages[i].type == TS_ENCODER_STAGE)
+	    {
+	    	avcodec_close(vs->video_stages[i].stage->encoder.vid_octx);
+	    	av_free(vs->video_stages[i].stage->encoder.vid_octx);
+	    	free(vs->video_stages[i].stage);
+	    }
+	  }
+
+      free(vs->video_stages);
   }
-
-  if(vs->vid_octx) {
-    avcodec_close(vs->vid_octx);
-    av_free(vs->vid_octx);
-  }
-
-  if(vs->vid_dec_frame)
-    av_free(vs->vid_dec_frame);
-
-  if(vs->vid_enc_frame)
-    av_free(vs->vid_enc_frame);
 
   if (vs->vid_first_pkt)
     pkt_ref_dec(vs->vid_first_pkt);
-
-  if (vs->flt_graph) {
-    avfilter_graph_free(&vs->flt_graph);
-    vs->flt_graph = NULL;
-  }
 
   transcoder_destroy_stream(t, ts);
 }
@@ -1800,7 +2094,7 @@ transcoder_init_video(transcoder_t *t, streaming_start_component_t *ssc)
   video_stream_t *vs;
   AVCodec *icodec, *ocodec;
   transcoder_props_t *tp = &t->t_props;
-  int sct;
+  int sct, i, k;
 
   if (tp->tp_vcodec[0] == '\0')
     return 0;
@@ -1817,7 +2111,9 @@ transcoder_init_video(transcoder_t *t, streaming_start_component_t *ssc)
   sct = codec_id2streaming_component_type(ocodec->id);
 
   vs = calloc(1, sizeof(video_stream_t));
+  vs->video_stages = calloc(NUMBER_OF_VIDEO_STAGES, sizeof(video_stage_t));
 
+  vs->ts_stages     = NUMBER_OF_VIDEO_STAGES;
   vs->ts_index      = ssc->ssc_index;
   vs->ts_type       = sct;
   vs->ts_target     = t->t_output;
@@ -1828,22 +2124,73 @@ transcoder_init_video(transcoder_t *t, streaming_start_component_t *ssc)
     pktbuf_ref_inc(ssc->ssc_gh);
   }
 
-  vs->vid_icodec = icodec;
-  vs->vid_ocodec = ocodec;
+  // Decoder
+  vs->video_stages[0].type = TS_DECODER_STAGE;
+  vs->video_stages[0].vs = vs;
+  vs->video_stages[0].prev = NULL;
+  vs->video_stages[0].next = &vs->video_stages[1];
+  vs->video_stages[0].number_of_stages = 1;
+  vs->video_stages[0].stage = calloc(1,sizeof(union stage));
+  vs->video_stages[0].stage->decoder.vid_icodec = icodec;
+  vs->video_stages[0].stage->decoder.vid_ictx = avcodec_alloc_context3_tvh(icodec);
+  vs->video_stages[0].stage->decoder.output_pipeline = calloc(1, sizeof(avframes_pipeline_t));
+  vs->video_stages[0].stage->decoder.output_pipeline->pipeline_size = NUMBER_OF_VIDEO_STAGES;
+  vs->video_stages[0].stage->decoder.output_pipeline->num_of_frames_available = 0;
+  vs->video_stages[0].stage->decoder.output_pipeline->push_pointer = 0;
+  vs->video_stages[0].stage->decoder.output_pipeline->pop_pointer = 0;
+  vs->video_stages[0].stage->decoder.output_pipeline->vid_frames = calloc(NUMBER_OF_VIDEO_STAGES, sizeof(AVFrame *));
 
-  vs->vid_ictx = avcodec_alloc_context3_tvh(icodec);
-  vs->vid_octx = avcodec_alloc_context3_tvh(ocodec);
+  for(i = 0; i < NUMBER_OF_VIDEO_STAGES; i++)
+  {
+	  vs->video_stages[0].stage->decoder.output_pipeline->vid_frames[i] = av_frame_alloc();
+	  av_frame_unref(vs->video_stages[0].stage->decoder.output_pipeline->vid_frames[i]);
+  }
 
-  if (t->t_props.tp_nrprocessors)
-    vs->vid_octx->thread_count = t->t_props.tp_nrprocessors;
+  // Filters
+  vs->video_stages[1].type = TS_FILTER_STAGE;
+  vs->video_stages[1].vs = vs;
+  vs->video_stages[1].prev = &vs->video_stages[0];
+  vs->video_stages[1].next = &vs->video_stages[2];
+  vs->video_stages[1].number_of_stages = NUMBER_OF_FILTER_STAGES;
+  vs->video_stages[1].stage = calloc(NUMBER_OF_FILTER_STAGES, sizeof(union stage));
 
-  vs->vid_dec_frame = av_frame_alloc();
-  vs->vid_enc_frame = av_frame_alloc();
 
-  av_frame_unref(vs->vid_dec_frame);
-  av_frame_unref(vs->vid_enc_frame);
+  // Init here the filters
+  for(k = 0; k < NUMBER_OF_FILTER_STAGES; k++)
+  {
+	  if(k == 0) // First filter shall take the decoder pipeline output
+		  vs->video_stages[1].stage[k].filter.input_pipeline = vs->video_stages[0].stage->decoder.output_pipeline;
+	  else
+		  vs->video_stages[1].stage[k].filter.input_pipeline = vs->video_stages[1].stage[k-1].filter.output_pipeline;
 
-  vs->flt_graph = NULL;		/* allocated in packet processor */
+	  vs->video_stages[1].stage[k].filter.flt_graph = NULL;
+	  vs->video_stages[1].stage[k].filter.output_pipeline = calloc(1, sizeof(avframes_pipeline_t));
+	  vs->video_stages[1].stage[k].filter.output_pipeline->pipeline_size = NUMBER_OF_VIDEO_STAGES;
+	  vs->video_stages[1].stage[k].filter.output_pipeline->num_of_frames_available = 0;
+	  vs->video_stages[1].stage[k].filter.output_pipeline->push_pointer = 0;
+	  vs->video_stages[1].stage[k].filter.output_pipeline->pop_pointer = 0;
+	  vs->video_stages[1].stage[k].filter.output_pipeline->vid_frames = calloc(1, NUMBER_OF_VIDEO_STAGES*sizeof(AVFrame *));
+
+	  for(i = 0; i < NUMBER_OF_VIDEO_STAGES; i++)
+	  {
+		  vs->video_stages[1].stage[k].filter.output_pipeline->vid_frames[i] = av_frame_alloc();
+		  av_frame_unref(vs->video_stages[1].stage[k].filter.output_pipeline->vid_frames[i]);
+	  }
+  }
+
+  // Encoder
+  vs->video_stages[2].type = TS_ENCODER_STAGE;
+  vs->video_stages[2].vs = vs;
+  vs->video_stages[2].prev = &vs->video_stages[1];
+  vs->video_stages[2].next = NULL;
+  vs->video_stages[2].number_of_stages = 1;
+  vs->video_stages[2].stage = calloc(1,sizeof(union stage));
+  vs->video_stages[2].stage->encoder.vid_ocodec = ocodec;
+  vs->video_stages[2].stage->encoder.vid_octx = avcodec_alloc_context3_tvh(ocodec);
+  vs->video_stages[2].stage->encoder.input_pipeline = vs->video_stages[1].stage[NUMBER_OF_FILTER_STAGES-1].filter.output_pipeline;
+
+//  if (t->t_props.tp_nrprocessors)
+//    vs->vid_octx->thread_count = t->t_props.tp_nrprocessors;
 
   LIST_INSERT_HEAD(&t->t_stream_list, (transcoder_stream_t*)vs, ts_link);
 
