@@ -98,11 +98,18 @@ typedef struct audio_stream {
 
 typedef struct avframes_pipeline {
 	AVFrame     **vid_frames;
-	int         pipeline_size;
-	int			push_pointer;
-	int			pop_pointer;
-	int 		num_of_frames_available;
+	int           pipeline_size;
+	int			  push_pointer;
+	int			  pop_pointer;
 } avframes_pipeline_t;
+
+
+typedef struct th_pkt_pipeline {
+	th_pkt_t    **pkt;
+	int           pipeline_size;
+	int			  push_pointer;
+	int			  pop_pointer;
+} th_pkt_pipeline_t;
 
 typedef struct tsAVFilterContext {
 	int i_width;
@@ -127,6 +134,7 @@ typedef struct video_stage {
 			AVCodecContext			*vid_ictx;
 			AVCodec					*vid_icodec;
     		AVPacket				packet;
+    		th_pkt_pipeline_t       *input_pipeline;
     		avframes_pipeline_t     *output_pipeline;
 		} decoder;
 		struct encoder {
@@ -157,6 +165,7 @@ typedef struct video_stream {
   int                        vid_first_sent;
   int                        vid_first_encoded;
   th_pkt_t                  *vid_first_pkt;
+  struct transcoder			*t;
 } video_stream_t;
 
 
@@ -559,17 +568,17 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
         ictx->extradata = av_malloc(ictx->extradata_size);
         memcpy(ictx->extradata,
                pktbuf_ptr(ts->ts_input_gh), pktbuf_len(ts->ts_input_gh));
-        tvhtrace(LS_TRANSCODE, "%04X: copy meta data for %s (len %zd)",
+        tvhtrace(LS_TRANSCODEA, "%04X: copy meta data for %s (len %zd)",
                  shortid(t), icodec->id == AV_CODEC_ID_AAC ? "AAC" : "VORBIS",
                  pktbuf_len(ts->ts_input_gh));
       } else {
-        tvherror(LS_TRANSCODE, "%04X: missing meta data for %s",
+        tvherror(LS_TRANSCODEA, "%04X: missing meta data for %s",
                  shortid(t), icodec->id == AV_CODEC_ID_AAC ? "AAC" : "VORBIS");
       }
     }
 
     if (avcodec_open2(ictx, icodec, NULL) < 0) {
-      tvherror(LS_TRANSCODE, "%04X: Unable to open %s decoder",
+      tvherror(LS_TRANSCODEA, "%04X: Unable to open %s decoder",
                shortid(t), icodec->name);
       transcoder_stream_invalidate(ts);
       goto cleanup;
@@ -579,7 +588,7 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   }
 
   if (pkt->pkt_pts > as->aud_dec_pts) {
-    tvhwarn(LS_TRANSCODE, "%04X: Detected framedrop in audio", shortid(t));
+    tvhwarn(LS_TRANSCODEA, "%04X: Detected framedrop in audio", shortid(t));
     as->aud_enc_pts += (pkt->pkt_pts - as->aud_dec_pts);
     as->aud_dec_pts += (pkt->pkt_pts - as->aud_dec_pts);
   }
@@ -593,24 +602,24 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   length = avcodec_decode_audio4(ictx, frame, &got_frame, &packet);
   av_free_packet(&packet);
 
-  tvhtrace(LS_TRANSCODE, "%04X: audio decode: consumed=%d size=%zu, got=%d, pts=%" PRIi64,
+  tvhtrace(LS_TRANSCODEA, "%04X: audio decode: consumed=%d size=%zu, got=%d, pts=%" PRIi64,
            shortid(t), length, pktbuf_len(pkt->pkt_payload), got_frame, pkt->pkt_pts);
 
   if (length < 0) {
     if (length == AVERROR_INVALIDDATA) goto cleanup;
-    tvherror(LS_TRANSCODE, "%04X: Unable to decode audio (%d, %s)",
+    tvherror(LS_TRANSCODEA, "%04X: Unable to decode audio (%d, %s)",
              shortid(t), length, get_error_text(length));
     transcoder_stream_invalidate(ts);
     goto cleanup;
   }
 
   if (!got_frame) {
-    tvhtrace(LS_TRANSCODE, "%04X: Did not have a full frame in the packet", shortid(t));
+    tvhtrace(LS_TRANSCODEA, "%04X: Did not have a full frame in the packet", shortid(t));
     goto cleanup;
   }
 
   if (length != pktbuf_len(pkt->pkt_payload))
-    tvhwarn(LS_TRANSCODE,
+    tvhwarn(LS_TRANSCODEA,
             "%04X: undecoded data (in=%zu, consumed=%d)",
             shortid(t), pktbuf_len(pkt->pkt_payload), length);
 
@@ -625,30 +634,30 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
     octx->flags          |= CODEC_FLAG_GLOBAL_HEADER;
 
     if (!octx->sample_rate) {
-      tvherror(LS_TRANSCODE, "%04X: audio encoder has no suitable sample rate!", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: audio encoder has no suitable sample rate!", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     } else {
-      tvhdebug(LS_TRANSCODE, "%04X: using audio sample rate %d",
+      tvhdebug(LS_TRANSCODEA, "%04X: using audio sample rate %d",
                           shortid(t), octx->sample_rate);
     }
 
     if (octx->sample_fmt == AV_SAMPLE_FMT_NONE) {
-      tvherror(LS_TRANSCODE, "%04X: audio encoder has no suitable sample format!", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: audio encoder has no suitable sample format!", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     } else {
-      tvhdebug(LS_TRANSCODE, "%04X: using audio sample format %s",
+      tvhdebug(LS_TRANSCODEA, "%04X: using audio sample format %s",
                           shortid(t), av_get_sample_fmt_name(octx->sample_fmt));
     }
 
     if (!octx->channel_layout) {
-      tvherror(LS_TRANSCODE, "%04X: audio encoder has no suitable channel layout!", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: audio encoder has no suitable channel layout!", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     } else {
       av_get_channel_layout_string(layout_buf, sizeof (layout_buf), octx->channels, octx->channel_layout);
-      tvhdebug(LS_TRANSCODE, "%04X: using audio channel layout %s",
+      tvhdebug(LS_TRANSCODEA, "%04X: using audio channel layout %s",
                           shortid(t), layout_buf);
     }
 
@@ -692,7 +701,7 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
     }
 
     if (avcodec_open2(octx, ocodec, NULL) < 0) {
-      tvherror(LS_TRANSCODE, "%04X: Unable to open %s encoder",
+      tvherror(LS_TRANSCODEA, "%04X: Unable to open %s encoder",
                shortid(t), ocodec->name);
       transcoder_stream_invalidate(ts);
       goto cleanup;
@@ -700,7 +709,7 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
 
     as->fifo = av_audio_fifo_alloc(octx->sample_fmt, octx->channels, 1);
     if (!as->fifo) {
-      tvherror(LS_TRANSCODE, "%04X: Could not allocate fifo", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: Could not allocate fifo", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     }
@@ -716,14 +725,14 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   if (as->last_sample_rate    != ictx->sample_rate    ||
       as->last_sample_fmt     != ictx->sample_fmt     ||
       as->last_channel_layout != ictx->channel_layout) {
-    tvhdebug(LS_TRANSCODE, "%04X: audio input format changed", shortid(t));
+    tvhdebug(LS_TRANSCODEA, "%04X: audio input format changed", shortid(t));
 
     as->last_sample_rate    = ictx->sample_rate;
     as->last_sample_fmt     = ictx->sample_fmt;
     as->last_channel_layout = ictx->channel_layout;
 
     if (as->resample_context) {
-      tvhdebug(LS_TRANSCODE, "%04X: stopping audio resampling", shortid(t));
+      tvhdebug(LS_TRANSCODEA, "%04X: stopping audio resampling", shortid(t));
       avresample_free(&as->resample_context);
       as->resample_context = NULL;
       as->resample_is_open = 0;
@@ -737,21 +746,21 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   if (as->resample) {
     if (!as->resample_context) {
       if (!(as->resample_context = avresample_alloc_context())) {
-        tvherror(LS_TRANSCODE, "%04X: Could not allocate resample context", shortid(t));
+        tvherror(LS_TRANSCODEA, "%04X: Could not allocate resample context", shortid(t));
         transcoder_stream_invalidate(ts);
         goto cleanup;
       }
 
       // resample audio
-      tvhdebug(LS_TRANSCODE, "%04X: starting audio resampling", shortid(t));
+      tvhdebug(LS_TRANSCODEA, "%04X: starting audio resampling", shortid(t));
 
       av_get_channel_layout_string(layout_buf, sizeof (layout_buf), ictx->channels, ictx->channel_layout);
-      tvhdebug(LS_TRANSCODE, "%04X: IN : channel_layout=%s, rate=%d, fmt=%s, bitrate=%"PRId64,
+      tvhdebug(LS_TRANSCODEA, "%04X: IN : channel_layout=%s, rate=%d, fmt=%s, bitrate=%"PRId64,
                shortid(t), layout_buf, ictx->sample_rate,
                av_get_sample_fmt_name(ictx->sample_fmt), (int64_t)ictx->bit_rate);
 
       av_get_channel_layout_string(layout_buf, sizeof (layout_buf), octx->channels, octx->channel_layout);
-      tvhdebug(LS_TRANSCODE, "%04X: OUT: channel_layout=%s, rate=%d, fmt=%s, bitrate=%"PRId64,
+      tvhdebug(LS_TRANSCODEA, "%04X: OUT: channel_layout=%s, rate=%d, fmt=%s, bitrate=%"PRId64,
                shortid(t), layout_buf, octx->sample_rate,
                av_get_sample_fmt_name(octx->sample_fmt), (int64_t)octx->bit_rate);
 
@@ -774,7 +783,7 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
                                 "out_sample_fmt", octx->sample_fmt, 1))
         goto cleanup;
       if (avresample_open(as->resample_context) < 0) {
-        tvherror(LS_TRANSCODE, "%04X: Error avresample_open", shortid(t));
+        tvherror(LS_TRANSCODEA, "%04X: Error avresample_open", shortid(t));
         transcoder_stream_invalidate(ts);
         goto cleanup;
       }
@@ -784,26 +793,26 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
     uint8_t **output = alloca(octx->channels * sizeof(uint8_t *));
 
     if (av_samples_alloc(output, NULL, octx->channels, frame->nb_samples, octx->sample_fmt, 1) < 0) {
-      tvherror(LS_TRANSCODE, "%04X: av_resamples_alloc failed", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: av_resamples_alloc failed", shortid(t));
       transcoder_stream_invalidate(ts);
       goto scleanup;
     }
 
     length = avresample_convert(as->resample_context, NULL, 0, frame->nb_samples,
                                 frame->extended_data, 0, frame->nb_samples);
-    tvhtrace(LS_TRANSCODE, "%04X: avresample_convert: %d", shortid(t), length);
+    tvhtrace(LS_TRANSCODEA, "%04X: avresample_convert: %d", shortid(t), length);
     while (avresample_available(as->resample_context) > 0) {
       length = avresample_read(as->resample_context, output, frame->nb_samples);
 
       if (length > 0) {
         if (av_audio_fifo_realloc(as->fifo, av_audio_fifo_size(as->fifo) + length) < 0) {
-          tvherror(LS_TRANSCODE, "%04X: Could not reallocate FIFO", shortid(t));
+          tvherror(LS_TRANSCODEA, "%04X: Could not reallocate FIFO", shortid(t));
           transcoder_stream_invalidate(ts);
           goto scleanup;
         }
 
         if (av_audio_fifo_write(as->fifo, (void **)output, length) < length) {
-          tvherror(LS_TRANSCODE, "%04X: Could not write to FIFO", shortid(t));
+          tvherror(LS_TRANSCODEA, "%04X: Could not write to FIFO", shortid(t));
           goto scleanup;
         }
       }
@@ -820,7 +829,7 @@ scleanup:
 /*  Need to find out where we are going to do this. Normally at the end.
     int delay_samples = avresample_get_delay(as->resample_context);
     if (delay_samples) {
-      tvhdebug(LS_TRANSCODE, "%d samples in resamples delay buffer.", delay_samples);
+      tvhdebug(LS_TRANSCODEA, "%d samples in resamples delay buffer.", delay_samples);
       goto cleanup;
     }
 */
@@ -828,13 +837,13 @@ scleanup:
   } else {
 
     if (av_audio_fifo_realloc(as->fifo, av_audio_fifo_size(as->fifo) + frame->nb_samples) < 0) {
-      tvherror(LS_TRANSCODE, "%04X: Could not reallocate FIFO", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: Could not reallocate FIFO", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     }
 
     if (av_audio_fifo_write(as->fifo, (void **)frame->extended_data, frame->nb_samples) < frame->nb_samples) {
-      tvherror(LS_TRANSCODE, "%04X: Could not write to FIFO", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: Could not write to FIFO", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     }
@@ -844,7 +853,7 @@ scleanup:
   as->aud_dec_pts += pkt->pkt_duration;
 
   while (av_audio_fifo_size(as->fifo) >= octx->frame_size) {
-    tvhtrace(LS_TRANSCODE, "%04X: audio loop: fifo=%d, frame=%d",
+    tvhtrace(LS_TRANSCODEA, "%04X: audio loop: fifo=%d, frame=%d",
              shortid(t), av_audio_fifo_size(as->fifo), octx->frame_size);
 
     av_frame_free(&frame);
@@ -857,18 +866,18 @@ scleanup:
     frame->channel_layout = octx->channel_layout;
     frame->sample_rate = octx->sample_rate;
     if (av_frame_get_buffer(frame, 0) < 0) {
-      tvherror(LS_TRANSCODE, "%04X: Could not allocate output frame samples", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: Could not allocate output frame samples", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     }
 
     if ((length = av_audio_fifo_read(as->fifo, (void **)frame->data, octx->frame_size)) != octx->frame_size) {
-      tvherror(LS_TRANSCODE, "%04X: Could not read data from FIFO", shortid(t));
+      tvherror(LS_TRANSCODEA, "%04X: Could not read data from FIFO", shortid(t));
       transcoder_stream_invalidate(ts);
       goto cleanup;
     }
 
-    tvhtrace(LS_TRANSCODE, "%04X: pre-encode: linesize=%d, samples=%d, pts=%" PRIi64,
+    tvhtrace(LS_TRANSCODEA, "%04X: pre-encode: linesize=%d, samples=%d, pts=%" PRIi64,
              shortid(t), frame->linesize[0], length, as->aud_enc_pts);
 
     frame->pts = as->aud_enc_pts;
@@ -878,12 +887,12 @@ scleanup:
     packet.data = NULL;
     packet.size = 0;
     length = avcodec_encode_audio2(octx, &packet, frame, &got_packet_ptr);
-    tvhtrace(LS_TRANSCODE, "%04X: encoded: packet=%d, ret=%d, got=%d, pts=%" PRIi64,
+    tvhtrace(LS_TRANSCODEA, "%04X: encoded: packet=%d, ret=%d, got=%d, pts=%" PRIi64,
              shortid(t), packet.size, length, got_packet_ptr, packet.pts);
 
     if ((length < 0) || (got_packet_ptr < -1)) {
 
-      tvherror(LS_TRANSCODE, "%04X: Unable to encode audio (%d:%d)",
+      tvherror(LS_TRANSCODEA, "%04X: Unable to encode audio (%d:%d)",
                shortid(t), length, got_packet_ptr);
       transcoder_stream_invalidate(ts);
       goto cleanup;
@@ -912,7 +921,7 @@ scleanup:
       if (octx->extradata_size)
         n->pkt_meta = pktbuf_alloc(octx->extradata, octx->extradata_size);
 
-      tvhtrace(LS_TRANSCODE, "%04X: deliver audio (pts = %" PRIi64 ", delay = %i)",
+      tvhtrace(LS_TRANSCODEA, "%04X: deliver audio (pts = %" PRIi64 ", delay = %i)",
                shortid(t), n->pkt_pts, octx->delay);
       sm = streaming_msg_create_pkt(n);
       streaming_target_deliver2(ts->ts_target, sm);
@@ -1220,7 +1229,8 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   AVCodec *icodec, *ocodec;
   AVCodecContext *ictx, *octx;
   AVDictionary *opts;
-  struct video_stage *stage;
+  th_pkt_t *packet;
+  struct video_stage *stage = NULL;
   struct decoder *decoder = NULL;
   struct filter  *filter = NULL;
   struct encoder *encoder = NULL;
@@ -1265,16 +1275,45 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   break;
   }
 
-  icodec = vs->video_stages[0].stage->decoder.vid_icodec;
 
   opts = NULL;
+
+  if (!vs->vid_first_sent) {
+    /* notify global headers that we're live */
+    /* the video packets might be delayed */
+    pkt2 = pkt_alloc(NULL, 0, pkt->pkt_pts, pkt->pkt_dts);
+    pkt2->pkt_componentindex = pkt->pkt_componentindex;
+    sm = streaming_msg_create_pkt(pkt2);
+    streaming_target_deliver2(ts->ts_target, sm);
+    pkt_ref_dec(pkt2);
+    vs->vid_first_sent = 1;
+  }
+
+  stage = &vs->video_stages[0];
+  decoder = &stage->stage->decoder;
+
+  push = decoder->input_pipeline->push_pointer;
+
+  tvhtrace(LS_TRANSCODE, "%04X: Video: available input packet %d", shortid(t), push);
+
+  decoder->input_pipeline->pkt[push] = pkt;
+
+  decoder->input_pipeline->push_pointer++;
+  if(decoder->input_pipeline->push_pointer >= decoder->input_pipeline->pipeline_size)
+	  decoder->input_pipeline->push_pointer = 0;
+
+  /*
+   * Schedule pipeline here
+   */
 
   /*
    * Get decoder handler and decode, this will become the decoder
    * stage task body
    */
+
   stage = &vs->video_stages[0];
   decoder = &stage->stage->decoder;
+  icodec = decoder->vid_icodec;
 
   ictx = decoder->vid_ictx;
 
@@ -1297,84 +1336,85 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
     }
   }
 
-  if (!vs->vid_first_sent) {
-    /* notify global headers that we're live */
-    /* the video packets might be delayed */
-    pkt2 = pkt_alloc(NULL, 0, pkt->pkt_pts, pkt->pkt_dts);
-    pkt2->pkt_componentindex = pkt->pkt_componentindex;
-    sm = streaming_msg_create_pkt(pkt2);
-    streaming_target_deliver2(ts->ts_target, sm);
-    pkt_ref_dec(pkt2);
-    vs->vid_first_sent = 1;
-  }
-
-  av_init_packet(&decoder->packet);
-
-  decoder->packet.data     = pktbuf_ptr(pkt->pkt_payload);
-  decoder->packet.size     = pktbuf_len(pkt->pkt_payload);
-  decoder->packet.pts      = pkt->pkt_pts;
-  decoder->packet.dts      = pkt->pkt_dts;
-  decoder->packet.duration = pkt->pkt_duration;
-
-  push = decoder->output_pipeline->push_pointer;
-
-  decoder->output_pipeline->vid_frames[push]->pts = decoder->packet.pts;
-  decoder->output_pipeline->vid_frames[push]->pkt_dts = decoder->packet.dts;
-  decoder->output_pipeline->vid_frames[push]->pkt_pts = decoder->packet.pts;
-
-  ictx->reordered_opaque = decoder->packet.pts;
-
-  tvhtrace(LS_TRANSCODE, "%04X: Decode: out push %d, ictx 0x%x", shortid(t), push, (unsigned int)ictx);
-
-  length = avcodec_decode_video2(ictx, decoder->output_pipeline->vid_frames[push], &got_picture, &decoder->packet);
-  if (length <= 0) {
-    if (length == AVERROR_INVALIDDATA) goto cleanup;
-    tvherror(LS_TRANSCODE, "%04X: Unable to decode video (%d, %s)",
-             shortid(t), length, get_error_text(length));
-    goto cleanup;
-  }
-
-  if (!got_picture)
+  pop = decoder->input_pipeline->pop_pointer;
+  if(pop != decoder->input_pipeline->push_pointer)
   {
-      goto cleanup;
-  }
-  else
-  {
-	  tvhtrace(LS_TRANSCODE, "%04X: Decoder: available output buffer %d", shortid(t), decoder->output_pipeline->push_pointer);
-	  decoder->output_pipeline->push_pointer++;
+	  tvhtrace(LS_TRANSCODE, "%04X: Decoder: available input packet %d", shortid(t), pop);
 
-	  if(decoder->output_pipeline->push_pointer >= decoder->output_pipeline->pipeline_size)
-		  decoder->output_pipeline->push_pointer = 0;
+	  packet = decoder->input_pipeline->pkt[pop];
 
-	  /*
-	   * Got a picture, set the encoder (last stage) context based on the first decoded picture
-	   * context
-	   */
-	  encoder = &vs->video_stages[vs->ts_stages-1].stage->encoder;
+	  decoder->input_pipeline->pop_pointer++;
+	  if(decoder->input_pipeline->pop_pointer >= decoder->input_pipeline->pipeline_size)
+		  decoder->input_pipeline->pop_pointer = 0;
 
-	  encoder->vid_octx->sample_aspect_ratio.num = ictx->sample_aspect_ratio.num;
-	  encoder->vid_octx->sample_aspect_ratio.den = ictx->sample_aspect_ratio.den;
+	  av_init_packet(&decoder->packet);
 
-	  encoder->vid_octx->width           = vs->vid_width  ? vs->vid_width  : ictx->width;
-	  encoder->vid_octx->height          = vs->vid_height ? vs->vid_height : ictx->height;
+	  decoder->packet.data     = pktbuf_ptr(packet->pkt_payload);
+	  decoder->packet.size     = pktbuf_len(packet->pkt_payload);
+	  decoder->packet.pts      = packet->pkt_pts;
+	  decoder->packet.dts      = packet->pkt_dts;
+	  decoder->packet.duration = packet->pkt_duration;
 
-	  // Encoder uses "time_base" for bitrate calculation, but "time_base" from decoder
-	  // will be deprecated in the future, therefore calculate "time_base" from "framerate" if available.
-	  encoder->vid_octx->ticks_per_frame = ictx->ticks_per_frame;
-	  if (ictx->framerate.num == 0) {
-	      ictx->framerate.num = 30;
-	      ictx->framerate.den = 1;
-	  }
-	  if (ictx->time_base.num == 0) {
-	    ictx->time_base.num = ictx->framerate.den;
-	    ictx->time_base.den = ictx->framerate.num;
-	  }
-	  encoder->vid_octx->framerate = ictx->framerate;
-	#if LIBAVCODEC_VERSION_MICRO >= 100 && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(56, 13, 100) // ffmpeg 2.5
-	  encoder->vid_octx->time_base       = av_inv_q(av_mul_q(ictx->framerate, av_make_q(ictx->ticks_per_frame, 1)));
-	#else
-	  encoder->vid_octx->time_base       = ictx->time_base;
-	#endif
+	  push = decoder->output_pipeline->push_pointer;
+
+	  decoder->output_pipeline->vid_frames[push]->pts = decoder->packet.pts;
+	  decoder->output_pipeline->vid_frames[push]->pkt_dts = decoder->packet.dts;
+	  decoder->output_pipeline->vid_frames[push]->pkt_pts = decoder->packet.pts;
+
+      ictx->reordered_opaque = decoder->packet.pts;
+
+      tvhtrace(LS_TRANSCODE, "%04X: Decode: out push %d, ictx 0x%x", shortid(t), push, (unsigned int)ictx);
+
+      length = avcodec_decode_video2(ictx, decoder->output_pipeline->vid_frames[push], &got_picture, &decoder->packet);
+      if (length <= 0) {
+        if (length == AVERROR_INVALIDDATA) goto cleanup;
+        tvherror(LS_TRANSCODE, "%04X: Unable to decode video (%d, %s)",
+                 shortid(t), length, get_error_text(length));
+        goto cleanup;
+      }
+
+      if (!got_picture)
+      {
+          goto cleanup;
+      }
+      else
+      {
+  	    tvhtrace(LS_TRANSCODE, "%04X: Decoder: available output buffer %d", shortid(t), decoder->output_pipeline->push_pointer);
+  	    decoder->output_pipeline->push_pointer++;
+
+  	    if(decoder->output_pipeline->push_pointer >= decoder->output_pipeline->pipeline_size)
+  	  	  decoder->output_pipeline->push_pointer = 0;
+
+  	    /*
+  	     * Got a picture, set the encoder (last stage) context based on the first decoded picture
+  	     * context
+  	     */
+  	    encoder = &vs->video_stages[vs->ts_stages-1].stage->encoder;
+
+  	    encoder->vid_octx->sample_aspect_ratio.num = ictx->sample_aspect_ratio.num;
+  	    encoder->vid_octx->sample_aspect_ratio.den = ictx->sample_aspect_ratio.den;
+
+  	    encoder->vid_octx->width           = vs->vid_width  ? vs->vid_width  : ictx->width;
+  	    encoder->vid_octx->height          = vs->vid_height ? vs->vid_height : ictx->height;
+
+  	    // Encoder uses "time_base" for bitrate calculation, but "time_base" from decoder
+  	    // will be deprecated in the future, therefore calculate "time_base" from "framerate" if available.
+  	    encoder->vid_octx->ticks_per_frame = ictx->ticks_per_frame;
+  	    if (ictx->framerate.num == 0) {
+  	        ictx->framerate.num = 30;
+  	        ictx->framerate.den = 1;
+  	    }
+  	    if (ictx->time_base.num == 0) {
+  	      ictx->time_base.num = ictx->framerate.den;
+  	      ictx->time_base.den = ictx->framerate.num;
+  	    }
+  	    encoder->vid_octx->framerate = ictx->framerate;
+  	  #if LIBAVCODEC_VERSION_MICRO >= 100 && LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(56, 13, 100) // ffmpeg 2.5
+  	    encoder->vid_octx->time_base       = av_inv_q(av_mul_q(ictx->framerate, av_make_q(ictx->ticks_per_frame, 1)));
+  	  #else
+  	    encoder->vid_octx->time_base       = ictx->time_base;
+  	  #endif
+      }
   }
   /*
    * Get filter handler and filter, this will become the decoder
@@ -2040,6 +2080,12 @@ transcoder_destroy_video(transcoder_t *t, transcoder_stream_t *ts)
 	    		free(vs->video_stages[i].stage->decoder.output_pipeline);
 	    	}
 
+	    	if(vs->video_stages[i].stage->decoder.input_pipeline)
+	    	{
+	    		free(vs->video_stages[i].stage->decoder.input_pipeline->pkt);
+	    		free(vs->video_stages[i].stage->decoder.input_pipeline);
+	    	}
+
 	    	free(vs->video_stages[i].stage);
 	    }
 
@@ -2113,6 +2159,7 @@ transcoder_init_video(transcoder_t *t, streaming_start_component_t *ssc)
   vs = calloc(1, sizeof(video_stream_t));
   vs->video_stages = calloc(NUMBER_OF_VIDEO_STAGES, sizeof(video_stage_t));
 
+  vs->t             = t;
   vs->ts_stages     = NUMBER_OF_VIDEO_STAGES;
   vs->ts_index      = ssc->ssc_index;
   vs->ts_type       = sct;
@@ -2133,9 +2180,14 @@ transcoder_init_video(transcoder_t *t, streaming_start_component_t *ssc)
   vs->video_stages[0].stage = calloc(1,sizeof(union stage));
   vs->video_stages[0].stage->decoder.vid_icodec = icodec;
   vs->video_stages[0].stage->decoder.vid_ictx = avcodec_alloc_context3_tvh(icodec);
+  vs->video_stages[0].stage->decoder.input_pipeline = calloc(1, sizeof(th_pkt_pipeline_t));
+  vs->video_stages[0].stage->decoder.input_pipeline->pipeline_size = NUMBER_OF_VIDEO_STAGES;
+  vs->video_stages[0].stage->decoder.input_pipeline->push_pointer = 0;
+  vs->video_stages[0].stage->decoder.input_pipeline->pop_pointer = 0;
+  vs->video_stages[0].stage->decoder.input_pipeline->pkt = calloc(NUMBER_OF_VIDEO_STAGES, sizeof(th_pkt_t *));
+
   vs->video_stages[0].stage->decoder.output_pipeline = calloc(1, sizeof(avframes_pipeline_t));
   vs->video_stages[0].stage->decoder.output_pipeline->pipeline_size = NUMBER_OF_VIDEO_STAGES;
-  vs->video_stages[0].stage->decoder.output_pipeline->num_of_frames_available = 0;
   vs->video_stages[0].stage->decoder.output_pipeline->push_pointer = 0;
   vs->video_stages[0].stage->decoder.output_pipeline->pop_pointer = 0;
   vs->video_stages[0].stage->decoder.output_pipeline->vid_frames = calloc(NUMBER_OF_VIDEO_STAGES, sizeof(AVFrame *));
@@ -2166,7 +2218,6 @@ transcoder_init_video(transcoder_t *t, streaming_start_component_t *ssc)
 	  vs->video_stages[1].stage[k].filter.flt_graph = NULL;
 	  vs->video_stages[1].stage[k].filter.output_pipeline = calloc(1, sizeof(avframes_pipeline_t));
 	  vs->video_stages[1].stage[k].filter.output_pipeline->pipeline_size = NUMBER_OF_VIDEO_STAGES;
-	  vs->video_stages[1].stage[k].filter.output_pipeline->num_of_frames_available = 0;
 	  vs->video_stages[1].stage[k].filter.output_pipeline->push_pointer = 0;
 	  vs->video_stages[1].stage[k].filter.output_pipeline->pop_pointer = 0;
 	  vs->video_stages[1].stage[k].filter.output_pipeline->vid_frames = calloc(1, NUMBER_OF_VIDEO_STAGES*sizeof(AVFrame *));
