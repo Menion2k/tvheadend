@@ -1240,6 +1240,9 @@ create_video_filter(struct filter *filter, transcoder_t *t)
   snprintf(opt, sizeof(opt), "yadif,scale=%dx%d",
 		   filter->fctx.o_width,
 		   filter->fctx.o_height);
+/*  snprintf(opt, sizeof(opt), "w3fdif,scale=%dx%d",
+		   filter->fctx.o_width,
+		   filter->fctx.o_height);*/
   err = avfilter_graph_parse_ptr(filter->flt_graph,
                                  opt,
                                  &flt_inputs,
